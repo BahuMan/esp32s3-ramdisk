@@ -5,6 +5,7 @@ I had to make the following changes:
 	-DARDUINO_USB_MODE=0
 	-DARDUINO_USB_CDC_ON_BOOT=1
 	-DCORE_DEBUG_LEVEL=1
+	-DUSE_TINYUSB
 
 ### in main.cpp
 > #include <Arduino.h>
