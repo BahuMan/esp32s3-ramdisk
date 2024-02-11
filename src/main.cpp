@@ -1,37 +1,33 @@
 #include <Arduino.h>
-#include <SD.h>
-
+//#include <SD.h>
+#include "SPI.h"
+#include "SdFat.h"
+#include "Adafruit_SPIFlash.h"
 #include "Adafruit_TinyUSB.h"
 
-// 8KB is the smallest size that windows allow to mount
-#include "ramdisk.h"
+// ESP32 use same flash device that store code.
+// Therefore there is no need to specify the SPI and SS
+Adafruit_FlashTransport_ESP32 flashTransport;
+Adafruit_SPIFlash flash(&flashTransport);
 
+// file system object from SdFat
+FatVolume fatfs;
+
+// USB Mass Storage object
 Adafruit_USBD_MSC usb_msc;
 
-// Eject button to demonstrate medium is not ready e.g SDCard is not present
-// whenever this button is pressed and hold, it will report to host as not ready
-#if defined(ARDUINO_SAMD_CIRCUITPLAYGROUND_EXPRESS) || defined(ARDUINO_NRF52840_CIRCUITPLAY)
-  #define BTN_EJECT   4   // Left Button
-  bool activeState = true;
+bool fs_formatted;  // Check if flash is formatted
+bool fs_changed;    // Set to true when browser write to flash
 
-#elif defined(ARDUINO_FUNHOUSE_ESP32S2)
-  #define BTN_EJECT   BUTTON_DOWN
-  bool activeState = true;
-
-#elif defined PIN_BUTTON1
-  #define BTN_EJECT   PIN_BUTTON1
-  bool activeState = false;
-#endif
 
 // Callback invoked when received READ10 command.
 // Copy disk's data to buffer (up to bufsize) and
 // return number of copied bytes (must be multiple of block size)
 int32_t msc_read_callback (uint32_t lba, void* buffer, uint32_t bufsize)
 {
-  uint8_t const* addr = msc_disk[lba];
-  memcpy(buffer, addr, bufsize);
-
-  return bufsize;
+  // Note: SPIFLash Bock API: readBlocks/writeBlocks/syncBlocks
+  // already include 4K sector caching internally. We don't need to cache it, yahhhh!!
+  return flash.readBlocks(lba, (uint8_t*) buffer, bufsize/512) ? bufsize : -1;
 }
 
 // Callback invoked when received WRITE10 command.
@@ -39,66 +35,108 @@ int32_t msc_read_callback (uint32_t lba, void* buffer, uint32_t bufsize)
 // return number of written bytes (must be multiple of block size)
 int32_t msc_write_callback (uint32_t lba, uint8_t* buffer, uint32_t bufsize)
 {
-  uint8_t* addr = msc_disk[lba];
-  memcpy(addr, buffer, bufsize);
+#ifdef LED_BUILTIN
+  digitalWrite(LED_BUILTIN, HIGH);
+#endif
 
-  return bufsize;
+  // Note: SPIFLash Bock API: readBlocks/writeBlocks/syncBlocks
+  // already include 4K sector caching internally. We don't need to cache it, yahhhh!!
+  return flash.writeBlocks(lba, buffer, bufsize/512) ? bufsize : -1;
 }
 
 // Callback invoked when WRITE10 command is completed (status received and accepted by host).
 // used to flush any pending cache.
 void msc_flush_callback (void)
 {
-  // nothing to do
+  // sync with flash
+  flash.syncBlocks();
+
+  // clear file system's cache to force refresh
+  fatfs.cacheClear();
+
+#ifdef LED_BUILTIN
+  digitalWrite(LED_BUILTIN, LOW);
+#endif
 }
 
-
-#ifdef BTN_EJECT
 // Invoked when received Test Unit Ready command.
 // return true allowing host to read/write this LUN e.g SD card inserted
 bool msc_ready_callback(void)
 {
-  // button not active --> medium ready
-  return digitalRead(BTN_EJECT) != activeState;
+  // if fs has changed, mark unit as not ready temporarily to force PC to flush cache
+  bool ret = !fs_changed;
+  fs_changed = false;
+  return ret;
 }
-#endif
 
-// the setup function runs once when you press reset or power the board
-void setup() {
-#if defined(ARDUINO_ARCH_MBED) && defined(ARDUINO_ARCH_RP2040)
-  // Manual begin() is required on core without built-in support for TinyUSB such as
-  // - mbed rp2040
-  TinyUSB_Device_Init(0);
-#endif
+void setupMassStorage(void)
+{
+  flash.begin();
 
   // Set disk vendor id, product id and revision with string up to 8, 16, 4 characters respectively
-  usb_msc.setID("Adafruit", "Mass Storage", "1.0");
-
-  // Set disk size
-  usb_msc.setCapacity(DISK_BLOCK_NUM, DISK_BLOCK_SIZE);
+  usb_msc.setID("Fri3d", "Badge Flash", "2024");
 
   // Set callback
   usb_msc.setReadWriteCallback(msc_read_callback, msc_write_callback, msc_flush_callback);
 
-  // Set Lun ready (RAM disk is always ready)
-  usb_msc.setUnitReady(true);
+  // Set disk size, block size should be 512 regardless of spi flash page size
+  usb_msc.setCapacity(flash.size()/512, 512);
 
-#ifdef BTN_EJECT
-  pinMode(BTN_EJECT, activeState ? INPUT_PULLDOWN : INPUT_PULLUP);
-  usb_msc.setReadyCallback(msc_ready_callback);
-#endif
+  // MSC is ready for read/write
+  fs_changed = false;
+  usb_msc.setReadyCallback(0, msc_ready_callback);
 
   usb_msc.begin();
 
+  // Init file system on the flash
+  fs_formatted = fatfs.begin(&flash);
+}
+
+void listFiles()
+{
+  File32 root = fatfs.open("/");
+  File32 file = root.openNextFile();
+  char buf[256];
+  while (file)
+  {
+    Serial.print("Content for file '");
+    file.getName(buf, 256);
+    Serial.print(buf);
+    Serial.println("':");
+
+    int l = 0;
+    do {
+      l = file.readBytes(buf, 255);
+      buf[l] = '\0';
+      Serial.print(buf);
+    } while (l > 0);
+
+    Serial.println();
+    Serial.println();
+    file = root.openNextFile();
+  }
+}
+// the setup function runs once when you press reset or power the board
+void setup() {
+
+  setupMassStorage();
+
   Serial.begin(115200);
   Serial.setDebugOutput(true);
-  delay(1000);   // wait for native usb
-  Serial.println("Adafruit TinyUSB Mass Storage RAM Disk example");
-  delay(1000);
+  delay(500);   // wait for native usb
+  if ( !fs_formatted )
+  {
+    Serial.println("Failed to init files system, flash may not be formatted");
+  }
+  else {
+    Serial.println("Fri3d Camp Mass Storage initialized");
+  }
+
+  listFiles();
 }
 
 void loop()
 {
-  Serial.println("waiting...");
+  listFiles();
   delay(2000);
 }
